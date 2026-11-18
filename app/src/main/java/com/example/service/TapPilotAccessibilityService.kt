@@ -91,9 +91,24 @@ class TapPilotAccessibilityService : AccessibilityService() {
             overlayController?.setTemporarilyHidden(false)
         }
 
-        val root = rootInActiveWindow ?: windows
-            ?.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
-            ?.root
+        val appWindowRoot = windows
+            ?.firstOrNull {
+                it.type == AccessibilityWindowInfo.TYPE_APPLICATION &&
+                    it.isActive &&
+                    it.root?.packageName?.toString() != packageName
+            }?.root
+            ?: windows
+                ?.firstOrNull {
+                    it.type == AccessibilityWindowInfo.TYPE_APPLICATION &&
+                        it.root?.packageName?.toString() != packageName
+                }?.root
+
+        val activeRoot = rootInActiveWindow
+        val root = if (activeRoot != null && activeRoot.packageName?.toString() != packageName) {
+            activeRoot
+        } else {
+            appWindowRoot ?: activeRoot
+        }
 
         val pkg = root?.packageName?.toString().orEmpty().ifBlank { "unknown" }
         val nodes = NodeTreeParser.extractNodes(
@@ -117,13 +132,18 @@ class TapPilotAccessibilityService : AccessibilityService() {
         action: PlannedAction,
         snapshot: UiSnapshot
     ): GestureExecutor.ExecutionResult {
-        return GestureExecutor.execute(
-            service = this,
-            action = action,
-            nodes = snapshot.nodes,
-            screenWidth = snapshot.screenWidth,
-            screenHeight = snapshot.screenHeight
-        )
+        overlayController?.setTouchPassthrough(true)
+        return try {
+            GestureExecutor.execute(
+                service = this,
+                action = action,
+                nodes = snapshot.nodes,
+                screenWidth = snapshot.screenWidth,
+                screenHeight = snapshot.screenHeight
+            )
+        } finally {
+            overlayController?.setTouchPassthrough(false)
+        }
     }
 
     fun navigateHome(): Boolean {

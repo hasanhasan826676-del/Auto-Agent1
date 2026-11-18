@@ -39,7 +39,7 @@ class GeminiAiPlanner {
         2. DRAG: Use (x, y) as start point and (endX, endY) as release point with optional durationMs (e.g. 250..1200ms).
            - For slider controls: drag the separate slider knob below the board horizontally to position the striker. NEVER drag the striker itself sideways on the baseline to reposition it, because touching & dragging the striker immediately aims and fires a shot!
            - For slingshot / Carrom / Pool / Golf aiming: start (x, y) at the exact center of the striker/ball and drag OPPOSITE to the desired shot direction by 160..340px to (endX, endY) with durationMs ~550ms, then release.
-           - CARROM TURN RULE: Whenever the striker on the bottom baseline OR the bottom slider knob below the board is visible, it IS YOUR TURN — ALWAYS execute a DRAG shot (or slider move) immediately! NEVER return WAIT when it is your turn.
+           - CARROM TURN RULE (CRITICAL): Whenever a striker of ANY color or custom skin (white, black, cyan, gold, red, brown/monster/dragon, patterned, or glowing ring) is sitting on the BOTTOM baseline (y ~ 58%-74%) OR a bottom slider knob below the board is visible, IT IS YOUR TURN — ALWAYS execute a DRAG shot (or slider move) immediately! NEVER return WAIT when any striker is on the bottom side. On opening break racks, pull back ~280..360px opposite the center cluster to smash cleanly; in Points/Freestyle mode (Red=50, White=20, Black=10), target Red/White first. Only WAIT if the striker is at the TOP baseline (opponent's turn).
         3. LONG_PRESS: Use (x, y) with durationMs (e.g. 700..1500ms) for hold-to-charge shots or context menus.
         4. INPUT_TEXT: Only on editable fields, with textToType.
         5. SCROLL_DOWN / SCROLL_UP / HOME / BACK: Use for off-screen content or launching the target app/game.
@@ -262,7 +262,8 @@ class GeminiAiPlanner {
         matchedContact: ContactProfile? = null,
         savedContactsSummary: String = "",
         chatGuardHint: String = "",
-        carromMemorySummary: String = ""
+        carromMemorySummary: String = "",
+        forceVision: Boolean = false
     ): Result<PlannedAction> {
         return try {
             val promptText = buildPrompt(
@@ -282,28 +283,14 @@ class GeminiAiPlanner {
                 carromMemorySummary = carromMemorySummary
             )
 
-            val interactiveNodes = snapshot.nodes.count { it.isClickable || it.isEditable }
-            val wasPreviousStepFailed = lastOutcomeHint.contains("[status=FAILED]", ignoreCase = true) ||
-                lastOutcomeHint.contains("[NO SCREEN CHANGE", ignoreCase = true) ||
-                lastOutcomeHint.contains("foul", ignoreCase = true)
-            val isSparseCanvasOrGame = interactiveNodes < 5
-            val taskProfile = if (stepNumber <= 1 || isSparseCanvasOrGame || wasPreviousStepFailed) {
-                AiTaskProfile.HIGH_ACCURACY
-            } else {
-                AiTaskProfile.FAST_UI
-            }
-            val effectiveScreenshot = if (
-                settings.smartTextFastPath &&
-                taskProfile == AiTaskProfile.FAST_UI &&
-                interactiveNodes >= 5 &&
-                !wasPreviousStepFailed
-            ) {
-                // Standard UI screens (Settings, chats, feeds) with rich clickable node trees run 2-3x faster
-                // and save ~80% tokens without attaching a heavy bitmap on every intermediate step.
-                null
-            } else {
-                snapshot.screenshot
-            }
+            val (taskProfile, attachScreenshot) = resolveVisionStrategy(
+                settings = settings,
+                interactiveNodes = snapshot.nodes.count { it.isClickable || it.isEditable },
+                lastOutcomeHint = lastOutcomeHint,
+                stepNumber = stepNumber,
+                forceVision = forceVision
+            )
+            val effectiveScreenshot = if (attachScreenshot) snapshot.screenshot else null
 
             val annotatedCopy = if (
                 effectiveScreenshot != null &&
@@ -562,5 +549,33 @@ $chatGuardSection$carromMemorySection
             UI NODE TREE (${snapshot.nodes.size} elements):
             $nodeTreeText
         """.trimIndent()
+    }
+
+    companion object {
+        fun resolveVisionStrategy(
+            settings: AgentSettings,
+            interactiveNodes: Int,
+            lastOutcomeHint: String,
+            stepNumber: Int,
+            forceVision: Boolean
+        ): Pair<AiTaskProfile, Boolean> {
+            val wasPreviousStepFailed = lastOutcomeHint.contains("[status=FAILED]", ignoreCase = true) ||
+                lastOutcomeHint.contains("[NO SCREEN CHANGE", ignoreCase = true) ||
+                lastOutcomeHint.contains("foul", ignoreCase = true)
+            val isSparseCanvasOrGame = interactiveNodes < 5 || forceVision
+            val taskProfile = if (stepNumber <= 1 || isSparseCanvasOrGame || wasPreviousStepFailed) {
+                AiTaskProfile.HIGH_ACCURACY
+            } else {
+                AiTaskProfile.FAST_UI
+            }
+            val attachScreenshot = !(
+                !forceVision &&
+                    settings.smartTextFastPath &&
+                    taskProfile == AiTaskProfile.FAST_UI &&
+                    interactiveNodes >= 5 &&
+                    !wasPreviousStepFailed
+                )
+            return taskProfile to attachScreenshot
+        }
     }
 }

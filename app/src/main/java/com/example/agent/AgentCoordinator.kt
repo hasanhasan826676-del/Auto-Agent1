@@ -5,6 +5,7 @@ import android.util.Log
 import com.example.ai.ApiKeyFailoverManager
 import com.example.ai.GeminiAiPlanner
 import com.example.game.BoardPieceCounts
+import com.example.game.CarromGeometrySolver
 import com.example.game.CarromMemoryData
 import com.example.game.CarromPowerStyle
 import com.example.game.CarromShotMemoryStore
@@ -384,20 +385,24 @@ object AgentCoordinator {
                         }
                     }
 
-                    val cacheMatch = if (currentSettings.useZeroApiActionCache && !justEvictedStaleCache) {
+                    val interactiveNodeCount = snapshot.nodes.count { it.isClickable || it.isEditable }
+                    val isCarromContext = CarromContextHelper.isCarromGoalOrApp(
+                        goal = goal,
+                        packageName = snapshot.packageName,
+                        playbookTopicKey = activePlaybook?.topicKey
+                    )
+                    val isLikelyCarromLobby = isCarromContext && CarromContextHelper.isLikelyGameLobbyMenu(snapshot.nodes)
+                    val isActiveCarromMatchScreen = isCarromContext && !isLikelyCarromLobby
+
+                    val cacheMatch = if (
+                        currentSettings.useZeroApiActionCache &&
+                        !justEvictedStaleCache &&
+                        !isActiveCarromMatchScreen
+                    ) {
                         actionCacheStore?.findReplayMatch(goal, snapshot)
                     } else {
                         null
                     }
-
-                    val interactiveNodeCount = snapshot.nodes.count { it.isClickable || it.isEditable }
-                    val isCarromContext = goal.contains("carrom", ignoreCase = true) ||
-                        goal.contains("ক্যারাম", ignoreCase = true) ||
-                        goal.contains("caram", ignoreCase = true) ||
-                        goal.contains("disc pool", ignoreCase = true) ||
-                        snapshot.packageName.contains("carrom", ignoreCase = true) ||
-                        snapshot.packageName.contains("caram", ignoreCase = true) ||
-                        (activePlaybook?.topicKey?.contains("carrom", ignoreCase = true) == true)
                     var usedLocalCarromSolver = false
 
                     val chatObs = ChatTurnGuard.extractChatObservation(snapshot)
@@ -534,8 +539,8 @@ object AgentCoordinator {
                     } else {
                         val localCarromAction: PlannedAction? = if (
                             currentSettings.carromPrecisionSolver &&
-                            isCarromContext &&
-                            interactiveNodeCount < 5 &&
+                            isActiveCarromMatchScreen &&
+                            interactiveNodeCount < 18 &&
                             snapshot.screenshot != null
                         ) {
                             val currentCarromMem = _carromMemory.value
@@ -545,7 +550,8 @@ object AgentCoordinator {
                                 screenHeight = snapshot.screenHeight,
                                 myCoinColor = myCarromCoinColor,
                                 consecutiveOfflineWaits = carromOfflineWaits,
-                                shotMemory = currentCarromMem
+                                shotMemory = currentCarromMem,
+                                allowStrikerRepositioning = !justRepositionedCarromSlider
                             )
 
                             // Evaluate the previous Carrom shot once coins have stopped moving
@@ -615,7 +621,7 @@ object AgentCoordinator {
                                     val needsSliderMove = !justRepositionedCarromSlider &&
                                         sliderKnob != null &&
                                         striker != null &&
-                                        kotlin.math.abs(sol.strikerPos.x - striker.center.x) > 32f
+                                        kotlin.math.abs(sol.strikerPos.x - striker.center.x) > 36f
 
                                     if (needsSliderMove) {
                                         justRepositionedCarromSlider = true
@@ -638,32 +644,45 @@ object AgentCoordinator {
                                         justRepositionedCarromSlider = false
                                         val didSlideBeforeThisShot = movedStrikerThisTurn
                                         movedStrikerThisTurn = false
+
+                                        // Re-lock aim vector strictly onto real detected striker center so we never drag empty wood
+                                        val lockedSol = if (
+                                            striker != null &&
+                                            kotlin.math.abs(sol.strikerPos.x - striker.center.x) > 8f
+                                        ) {
+                                            CarromGeometrySolver.solveBestShot(
+                                                board = outcome.board,
+                                                pieces = outcome.boardPieces,
+                                                myCoinColor = myCarromCoinColor,
+                                                screenWidth = snapshot.screenWidth,
+                                                screenHeight = snapshot.screenHeight,
+                                                existingStriker = striker,
+                                                canRepositionStriker = false,
+                                                shotMemory = currentCarromMem
+                                            ) ?: sol
+                                        } else {
+                                            sol
+                                        }
+
                                         if (outcome.boardPieces.isNotEmpty()) {
                                             nextPendingCarromShotCandidate = PendingCarromShotRecord(
                                                 myCoinColor = myCarromCoinColor,
-                                                targetCoinColor = sol.targetCoin.color,
-                                                pocketIndex = sol.pocketIndex,
-                                                cutAngleDeg = sol.cutAngleDeg,
-                                                powerStyle = sol.powerStyle,
+                                                targetCoinColor = lockedSol.targetCoin.color,
+                                                pocketIndex = lockedSol.pocketIndex,
+                                                cutAngleDeg = lockedSol.cutAngleDeg,
+                                                powerStyle = lockedSol.powerStyle,
                                                 movedStrikerWithSlider = didSlideBeforeThisShot,
-                                                isBankShot = sol.isBankShot,
-                                                isComboShot = sol.isComboShot,
-                                                isBreakShot = sol.isBreakShot,
+                                                isBankShot = lockedSol.isBankShot,
+                                                isComboShot = lockedSol.isComboShot,
+                                                isBreakShot = lockedSol.isBreakShot,
                                                 preCounts = CarromShotMemoryStore.countBoardPieces(outcome.boardPieces, myCarromCoinColor)
                                             )
                                         }
-                                        val shootStartX = if (striker != null && sliderKnob == null) {
-                                            striker.center.x
-                                        } else {
-                                            sol.strikerPos.x
-                                        }
-                                        val shootStartY = if (striker != null && sliderKnob == null) {
-                                            striker.center.y
-                                        } else {
-                                            sol.strikerPos.y
-                                        }
-                                        val dx = sol.dragEnd.x - sol.strikerPos.x
-                                        val dy = sol.dragEnd.y - sol.strikerPos.y
+
+                                        val shootStartX = striker?.center?.x ?: lockedSol.strikerPos.x
+                                        val shootStartY = striker?.center?.y ?: lockedSol.strikerPos.y
+                                        val dx = lockedSol.dragEnd.x - lockedSol.strikerPos.x
+                                        val dy = lockedSol.dragEnd.y - lockedSol.strikerPos.y
                                         val shootEndX = (shootStartX + dx).toInt().coerceIn(16, (snapshot.screenWidth - 16).coerceAtLeast(17))
                                         val shootEndY = (shootStartY + dy).toInt().coerceIn(16, (snapshot.screenHeight - 16).coerceAtLeast(17))
                                         PlannedAction(
@@ -676,8 +695,8 @@ object AgentCoordinator {
                                             durationMs = 560L,
                                             textToType = null,
                                             waitSeconds = null,
-                                            memoryNote = "Carrom Solver (${myCarromCoinColor.name}): ${sol.reason}",
-                                            reason = "Zero-API Carrom Solver: ${sol.reason} (conf=${(sol.confidenceScore * 100).toInt()}%)",
+                                            memoryNote = "Carrom Solver (${myCarromCoinColor.name}): ${lockedSol.reason}",
+                                            reason = "Zero-API Carrom Solver: ${lockedSol.reason} (conf=${(lockedSol.confidenceScore * 100).toInt()}%)",
                                             requiresConfirmation = false
                                         )
                                     }
@@ -685,6 +704,7 @@ object AgentCoordinator {
                                 is CarromVisionOutcome.NeedsAiVision -> {
                                     carromOfflineWaits = 0
                                     justRepositionedCarromSlider = false
+                                    lastOutcomeHint = "[Carrom Local Vision: ${outcome.diagnostic}] $lastOutcomeHint"
                                     if (outcome.boardPieces.isNotEmpty()) {
                                         aiPreCarromCounts = CarromShotMemoryStore.countBoardPieces(outcome.boardPieces, myCarromCoinColor)
                                     }
@@ -692,6 +712,9 @@ object AgentCoordinator {
                                 }
                             }
                         } else {
+                            if (isCarromContext && snapshot.screenshot == null) {
+                                lastOutcomeHint = "[CARROM SCREENSHOT MISSING (${snapshot.captureNote}) — Turn ON Multimodal Vision Screenshot in Settings and ensure game allows screen capture.] $lastOutcomeHint"
+                            }
                             null
                         }
 
@@ -700,13 +723,18 @@ object AgentCoordinator {
                             localCarromAction
                         } else {
                             try {
+                                val thinkingNote = if (isCarromContext && snapshot.screenshot == null) {
+                                    "Carrom Screenshot Missing: ${snapshot.captureNote}"
+                                } else {
+                                    snapshot.captureNote
+                                }
                                 _uiState.value = AgentUiState.Running(
                                     goal = goal,
                                     mode = mode,
                                     currentStep = step,
                                     maxSteps = maxStepsLimit,
                                     phase = AgentPhase.THINKING,
-                                    lastThought = snapshot.captureNote,
+                                    lastThought = thinkingNote,
                                     workingMemory = workingMemory,
                                     trace = trace.toList()
                                 )
@@ -732,7 +760,8 @@ object AgentCoordinator {
                                         matchedContact = matchedContact,
                                         savedContactsSummary = savedContactsSummary,
                                         chatGuardHint = chatGuardHint,
-                                        carromMemorySummary = carromPromptMem
+                                        carromMemorySummary = carromPromptMem,
+                                        forceVision = isCarromContext
                                     )
                                 }
 

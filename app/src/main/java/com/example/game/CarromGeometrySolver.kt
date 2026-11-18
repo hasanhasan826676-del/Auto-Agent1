@@ -89,8 +89,11 @@ object CarromGeometrySolver {
     ): CarromShotSolution? {
         if (board.pockets.size < 4) return null
 
-        val targetPieces = pieces.filter {
+        val primaryTargets = pieces.filter {
             it.color == myCoinColor || it.color == CoinColor.QUEEN
+        }
+        val targetPieces = primaryTargets.ifEmpty {
+            pieces.filter { it.color != CoinColor.STRIKER }
         }
         if (targetPieces.isEmpty()) return null
 
@@ -531,6 +534,41 @@ object CarromGeometrySolver {
                     reason = "Power Break / Cluster Scatter -> ${anchorCoin.color.name} (${anchorCoin.center.x.toInt()},${anchorCoin.center.y.toInt()})"
                 )
             }
+        }
+
+        // Guaranteed non-null fallback if striker is on baseline and every angle tripped strict scratch margin
+        if (bestBreak == null) {
+            val strikerPos = strikerCandidates.first()
+            val offsetAim = Point2D(
+                x = (anchorCoin.center.x + board.coinRadiusPx * 0.65f).coerceIn(board.left + board.coinRadiusPx, board.right - board.coinRadiusPx),
+                y = anchorCoin.center.y
+            )
+            val toCluster = offsetAim - strikerPos
+            val dir = if (toCluster.length() > 1e-2f) toCluster.normalized() else Point2D(0f, -1f)
+            val dragEnd = computeSlingshotDragEnd(
+                strikerPos = strikerPos,
+                shotDir = dir,
+                totalDistance = board.width * 1.35f,
+                boardWidth = board.width,
+                screenWidth = screenWidth,
+                screenHeight = screenHeight,
+                cutAngleDeg = 0f,
+                powerMultiplier = 1.35f
+            )
+            bestBreak = CarromShotSolution(
+                strikerPos = strikerPos,
+                dragEnd = dragEnd,
+                ghostBall = offsetAim,
+                targetCoin = anchorCoin,
+                targetPocket = nearestPocket,
+                pocketIndex = nearestPocketIdx,
+                cutAngleDeg = 0f,
+                isBankShot = false,
+                isBreakShot = true,
+                powerStyle = CarromPowerStyle.HARD,
+                confidenceScore = 0.51f,
+                reason = "Guaranteed Break Shot -> ${anchorCoin.color.name} (${anchorCoin.center.x.toInt()},${anchorCoin.center.y.toInt()})"
+            )
         }
         return bestBreak
     }

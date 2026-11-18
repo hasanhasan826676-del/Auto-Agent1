@@ -343,4 +343,288 @@ class ExampleRobolectricTest {
         org.junit.Assert.assertTrue(decoded.learnedPowerScaleFor(1, 10f) < 1.0f)
         org.junit.Assert.assertTrue(decoded.formatForPrompt().contains("Top-Right Pocket"))
     }
+
+    @Test
+    fun `carrom vision detector locks shot origin to actual striker when allowStrikerRepositioning is false`() {
+        com.example.game.CarromVisionDetector.resetMotionHistory()
+        val width = 540
+        val height = 1000
+        val bm = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+        bm.eraseColor(android.graphics.Color.rgb(212, 174, 122))
+
+        fun paintDisc(cx: Float, cy: Float, r: Float, colorInt: Int) {
+            val rSq = r * r
+            val minX = (cx - r).toInt().coerceIn(0, width - 1)
+            val maxX = (cx + r).toInt().coerceIn(0, width - 1)
+            val minY = (cy - r).toInt().coerceIn(0, height - 1)
+            val maxY = (cy + r).toInt().coerceIn(0, height - 1)
+            for (y in minY..maxY) {
+                for (x in minX..maxX) {
+                    val dx = x - cx
+                    val dy = y - cy
+                    if (dx * dx + dy * dy <= rSq) {
+                        bm.setPixel(x, y, colorInt)
+                    }
+                }
+            }
+        }
+
+        val boardLeft = width * 0.055f
+        val boardWidth = width * 0.89f
+        val boardTop = (height - boardWidth) * 0.48f
+        val boardBottom = boardTop + boardWidth
+        val baselineY = boardTop + boardWidth * 0.845f
+        val strikerBmX = boardLeft + boardWidth * 0.68f // Off-center striker
+
+        paintDisc(boardLeft + boardWidth * 0.28f, boardTop + boardWidth * 0.34f, 15f, android.graphics.Color.rgb(248, 248, 245))
+        paintDisc(strikerBmX, baselineY, 19f, android.graphics.Color.rgb(0, 215, 235))
+        paintDisc(strikerBmX, boardBottom + height * 0.06f, 16f, android.graphics.Color.rgb(255, 200, 30))
+
+        val outcome = com.example.game.CarromVisionDetector.analyzeAndSolve(
+            screenshot = bm,
+            screenWidth = 1080,
+            screenHeight = 2000,
+            myCoinColor = com.example.game.CoinColor.WHITE,
+            consecutiveOfflineWaits = 0,
+            allowStrikerRepositioning = false
+        )
+
+        org.junit.Assert.assertTrue(outcome is com.example.game.CarromVisionOutcome.SolvedShot)
+        val solved = outcome as com.example.game.CarromVisionOutcome.SolvedShot
+        val striker = solved.detectedStriker
+        org.junit.Assert.assertNotNull(striker)
+        org.junit.Assert.assertNotNull(solved.detectedSliderKnob)
+        assertEquals(striker!!.center.x, solved.solution.strikerPos.x, 4f)
+        assertEquals(striker.center.y, solved.solution.strikerPos.y, 4f)
+
+        bm.recycle()
+        com.example.game.CarromVisionDetector.resetMotionHistory()
+    }
+
+    @Test
+    fun `carrom vision detector shoots for custom patterned brown striker and brown slider bar like disc pool screenshot`() {
+        com.example.game.CarromVisionDetector.resetMotionHistory()
+        val width = 540
+        val height = 1200
+        val bm = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+        // Dark-red outer background like Carrom Disc Pool
+        bm.eraseColor(android.graphics.Color.rgb(92, 24, 18))
+
+        fun paintRect(left: Float, top: Float, right: Float, bottom: Float, colorInt: Int) {
+            val l = left.toInt().coerceIn(0, width - 1)
+            val t = top.toInt().coerceIn(0, height - 1)
+            val r = right.toInt().coerceIn(0, width - 1)
+            val b = bottom.toInt().coerceIn(0, height - 1)
+            for (y in t..b) {
+                for (x in l..r) {
+                    bm.setPixel(x, y, colorInt)
+                }
+            }
+        }
+
+        fun paintDisc(cx: Float, cy: Float, r: Float, colorInt: Int) {
+            val rSq = r * r
+            val minX = (cx - r).toInt().coerceIn(0, width - 1)
+            val maxX = (cx + r).toInt().coerceIn(0, width - 1)
+            val minY = (cy - r).toInt().coerceIn(0, height - 1)
+            val maxY = (cy + r).toInt().coerceIn(0, height - 1)
+            for (y in minY..maxY) {
+                for (x in minX..maxX) {
+                    val dx = x - cx
+                    val dy = y - cy
+                    if (dx * dx + dy * dy <= rSq) {
+                        bm.setPixel(x, y, colorInt)
+                    }
+                }
+            }
+        }
+
+        val boardLeft = width * 0.055f
+        val boardWidth = width * 0.89f
+        val boardRight = boardLeft + boardWidth
+        val boardTop = (height - boardWidth) * 0.48f
+        val boardBottom = boardTop + boardWidth
+        val baselineY = boardTop + boardWidth * 0.845f
+
+        // Warm tan board interior
+        paintRect(boardLeft, boardTop, boardRight, boardBottom, android.graphics.Color.rgb(212, 170, 128))
+        // Stationary small orange baseline end-circles
+        paintDisc(boardLeft + boardWidth * 0.175f, baselineY, 12f, android.graphics.Color.rgb(214, 122, 26))
+        paintDisc(boardLeft + boardWidth * 0.825f, baselineY, 12f, android.graphics.Color.rgb(214, 122, 26))
+
+        // Touching opening break rack in board center (Red Queen + 6 touching white + 6 outer black)
+        val cx = boardLeft + boardWidth * 0.50f
+        val cy = boardTop + boardWidth * 0.50f
+        paintDisc(cx, cy, 14f, android.graphics.Color.rgb(210, 26, 30))
+        val ringAngles = listOf(0.0, 60.0, 120.0, 180.0, 240.0, 300.0)
+        for (deg in ringAngles) {
+            val rad = Math.toRadians(deg)
+            val wx = cx + (27f * kotlin.math.cos(rad)).toFloat()
+            val wy = cy + (27f * kotlin.math.sin(rad)).toFloat()
+            paintDisc(wx, wy, 14f, android.graphics.Color.rgb(235, 228, 212))
+            val bx = cx + (52f * kotlin.math.cos(rad + 0.52)).toFloat()
+            val by = cy + (52f * kotlin.math.sin(rad + 0.52)).toFloat()
+            paintDisc(bx, by, 14f, android.graphics.Color.rgb(24, 24, 26))
+        }
+
+        // Custom patterned dark-brown/silver/maroon monster striker on bottom baseline (NO cyan/gold)
+        val strikerX = boardLeft + boardWidth * 0.50f
+        paintDisc(strikerX, baselineY, 21f, android.graphics.Color.rgb(74, 42, 26))
+        paintDisc(strikerX, baselineY + 3f, 9f, android.graphics.Color.rgb(165, 36, 44))
+        paintDisc(strikerX, baselineY - 5f, 6f, android.graphics.Color.rgb(190, 185, 175))
+
+        // Horizontal brown slider bar below board with matching brown/maroon knob at strikerX
+        val sliderY = boardBottom + height * 0.145f
+        paintRect(
+            boardLeft + boardWidth * 0.16f,
+            sliderY - 11f,
+            boardLeft + boardWidth * 0.84f,
+            sliderY + 11f,
+            android.graphics.Color.rgb(142, 92, 54)
+        )
+        paintDisc(strikerX, sliderY, 14f, android.graphics.Color.rgb(58, 30, 18))
+        paintDisc(strikerX, sliderY + 2f, 6f, android.graphics.Color.rgb(175, 42, 48))
+
+        val outcome = com.example.game.CarromVisionDetector.analyzeAndSolve(
+            screenshot = bm,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            myCoinColor = com.example.game.CoinColor.WHITE,
+            consecutiveOfflineWaits = 0
+        )
+
+        org.junit.Assert.assertTrue(
+            "Expected SolvedShot even with custom brown/patterned striker & brown slider bar, got $outcome",
+            outcome is com.example.game.CarromVisionOutcome.SolvedShot
+        )
+        val solved = outcome as com.example.game.CarromVisionOutcome.SolvedShot
+        org.junit.Assert.assertNotNull(solved.detectedStriker)
+        org.junit.Assert.assertNotNull(solved.detectedSliderKnob)
+        assertEquals(540f, solved.detectedStriker!!.center.x, 25f)
+
+        bm.recycle()
+        com.example.game.CarromVisionDetector.resetMotionHistory()
+    }
+
+    @Test
+    fun `carrom vision detector does not shoot when striker is on opponent top side and bottom baseline is empty`() {
+        com.example.game.CarromVisionDetector.resetMotionHistory()
+        val width = 540
+        val height = 1200
+        val bm = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+        bm.eraseColor(android.graphics.Color.rgb(92, 24, 18))
+
+        fun paintRect(left: Float, top: Float, right: Float, bottom: Float, colorInt: Int) {
+            val l = left.toInt().coerceIn(0, width - 1)
+            val t = top.toInt().coerceIn(0, height - 1)
+            val r = right.toInt().coerceIn(0, width - 1)
+            val b = bottom.toInt().coerceIn(0, height - 1)
+            for (y in t..b) {
+                for (x in l..r) {
+                    bm.setPixel(x, y, colorInt)
+                }
+            }
+        }
+
+        fun paintDisc(cx: Float, cy: Float, r: Float, colorInt: Int) {
+            val rSq = r * r
+            val minX = (cx - r).toInt().coerceIn(0, width - 1)
+            val maxX = (cx + r).toInt().coerceIn(0, width - 1)
+            val minY = (cy - r).toInt().coerceIn(0, height - 1)
+            val maxY = (cy + r).toInt().coerceIn(0, height - 1)
+            for (y in minY..maxY) {
+                for (x in minX..maxX) {
+                    val dx = x - cx
+                    val dy = y - cy
+                    if (dx * dx + dy * dy <= rSq) {
+                        bm.setPixel(x, y, colorInt)
+                    }
+                }
+            }
+        }
+
+        val boardLeft = width * 0.055f
+        val boardWidth = width * 0.89f
+        val boardRight = boardLeft + boardWidth
+        val boardTop = (height - boardWidth) * 0.48f
+        val boardBottom = boardTop + boardWidth
+        val bottomBaselineY = boardTop + boardWidth * 0.845f
+        val topBaselineY = boardTop + boardWidth * 0.155f
+
+        paintRect(boardLeft, boardTop, boardRight, boardBottom, android.graphics.Color.rgb(212, 170, 128))
+        // Stationary small orange end-circles on bottom baseline (NO player striker)
+        paintDisc(boardLeft + boardWidth * 0.175f, bottomBaselineY, 11f, android.graphics.Color.rgb(214, 122, 26))
+        paintDisc(boardLeft + boardWidth * 0.825f, bottomBaselineY, 11f, android.graphics.Color.rgb(214, 122, 26))
+
+        // Opponent striker sitting on TOP baseline + a couple of coins in center
+        paintDisc(boardLeft + boardWidth * 0.50f, topBaselineY, 20f, android.graphics.Color.rgb(74, 42, 26))
+        paintDisc(boardLeft + boardWidth * 0.36f, boardTop + boardWidth * 0.42f, 14f, android.graphics.Color.rgb(235, 228, 212))
+        paintDisc(boardLeft + boardWidth * 0.62f, boardTop + boardWidth * 0.48f, 14f, android.graphics.Color.rgb(24, 24, 26))
+
+        // Empty uniform brown slider track with NO knob
+        val sliderY = boardBottom + height * 0.145f
+        paintRect(
+            boardLeft + boardWidth * 0.16f,
+            sliderY - 11f,
+            boardLeft + boardWidth * 0.84f,
+            sliderY + 11f,
+            android.graphics.Color.rgb(142, 92, 54)
+        )
+
+        val outcome = com.example.game.CarromVisionDetector.analyzeAndSolve(
+            screenshot = bm,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            myCoinColor = com.example.game.CoinColor.WHITE,
+            consecutiveOfflineWaits = 0
+        )
+
+        org.junit.Assert.assertTrue(
+            "Expected WaitStillnessOrTurn during opponent top-baseline turn, got $outcome",
+            outcome is com.example.game.CarromVisionOutcome.WaitStillnessOrTurn
+        )
+
+        bm.recycle()
+        com.example.game.CarromVisionDetector.resetMotionHistory()
+    }
+
+    @Test
+    fun `carrom vision detector solves real uploaded carrom disc pool screenshot immediately`() {
+        val candidates = listOf(
+            java.io.File("public/assets/aistudio/Screenshot_20261119_013520_Carrom_Disc_Pool_66343f37.jpg"),
+            java.io.File("../public/assets/aistudio/Screenshot_20261119_013520_Carrom_Disc_Pool_66343f37.jpg")
+        )
+        val file = candidates.firstOrNull { it.exists() }
+        org.junit.Assert.assertNotNull(
+            "Screenshot file not found from ${java.io.File(".").absolutePath}",
+            file
+        )
+
+        val decoded = android.graphics.BitmapFactory.decodeFile(file!!.absolutePath)
+        org.junit.Assert.assertNotNull(decoded)
+        val raw = decoded!!
+        val scaled = android.graphics.Bitmap.createScaledBitmap(raw, 540, 1200, true)
+
+        com.example.game.CarromVisionDetector.resetMotionHistory()
+        val outcome = com.example.game.CarromVisionDetector.analyzeAndSolve(
+            screenshot = scaled,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            myCoinColor = com.example.game.CoinColor.WHITE,
+            consecutiveOfflineWaits = 0
+        )
+
+        org.junit.Assert.assertTrue(
+            "Expected SolvedShot on real Carrom Disc Pool screenshot, got $outcome",
+            outcome is com.example.game.CarromVisionOutcome.SolvedShot
+        )
+        val solved = outcome as com.example.game.CarromVisionOutcome.SolvedShot
+        org.junit.Assert.assertNotNull("Expected bottom striker detected", solved.detectedStriker)
+        org.junit.Assert.assertNotNull("Expected bottom slider knob detected", solved.detectedSliderKnob)
+        assertEquals(540f, solved.detectedStriker!!.center.x, 45f)
+
+        scaled.recycle()
+        if (raw !== scaled) raw.recycle()
+        com.example.game.CarromVisionDetector.resetMotionHistory()
+    }
 }

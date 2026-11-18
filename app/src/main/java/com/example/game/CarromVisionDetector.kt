@@ -45,7 +45,8 @@ object CarromVisionDetector {
         screenHeight: Int,
         myCoinColor: CoinColor,
         consecutiveOfflineWaits: Int,
-        shotMemory: CarromMemoryData? = null
+        shotMemory: CarromMemoryData? = null,
+        allowStrikerRepositioning: Boolean = true
     ): CarromVisionOutcome {
         if (screenshot == null || screenshot.width < 120 || screenshot.height < 120) {
             return CarromVisionOutcome.NeedsAiVision("No screenshot available for Carrom solver.")
@@ -54,34 +55,36 @@ object CarromVisionDetector {
         val scaleX = screenWidth.toFloat() / screenshot.width.toFloat()
         val scaleY = screenHeight.toFloat() / screenshot.height.toFloat()
 
-        // Estimate square Carrom board region (supports portrait & landscape + slight vertical variance)
+        // Estimate square Carrom board region (supports portrait & landscape + vertical HUD variance)
         val (boardBmLeft, boardBmTop, boardBmRight, boardBmBottom) = estimateBoardBitmapBounds(screenshot)
         val boardBmWidth = (boardBmRight - boardBmLeft).coerceAtLeast(40)
         val boardBmHeight = (boardBmBottom - boardBmTop).coerceAtLeast(40)
 
-        // 1. Offline Motion / Stillness check on inner 80% of board (ignores pulsing edge timers/avatars)
-        val innerPadX = (boardBmWidth * 0.10f).toInt()
-        val innerPadY = (boardBmHeight * 0.10f).toInt()
+        // 1. Offline Motion / Stillness check on central playfield [0.16..0.76] (ignores pulsing baseline striker halo)
+        val innerPadX = (boardBmWidth * 0.12f).toInt()
+        val motionTop = (boardBmTop + (boardBmHeight * 0.16f).toInt()).coerceIn(0, screenshot.height - 2)
+        val motionBottom = (boardBmTop + (boardBmHeight * 0.76f).toInt()).coerceIn(motionTop + 1, screenshot.height - 1)
         val currentLuma = sampleBoardLumaGrid(
             bitmap = screenshot,
             left = (boardBmLeft + innerPadX).coerceIn(0, screenshot.width - 2),
-            top = (boardBmTop + innerPadY).coerceIn(0, screenshot.height - 2),
+            top = motionTop,
             right = (boardBmRight - innerPadX).coerceIn(1, screenshot.width - 1),
-            bottom = (boardBmBottom - innerPadY).coerceIn(1, screenshot.height - 1)
+            bottom = motionBottom
         )
         val prevLuma = previousBoardLuma
         previousBoardLuma = currentLuma
 
+        val effectiveMotionThreshold = if (allowStrikerRepositioning) MOTION_THRESHOLD else MOTION_THRESHOLD * 1.55f
         if (prevLuma != null && consecutiveOfflineWaits < 2) {
             val meanDiff = computeMeanAbsDiff(prevLuma, currentLuma)
-            if (meanDiff > MOTION_THRESHOLD) {
+            if (meanDiff > effectiveMotionThreshold) {
                 return CarromVisionOutcome.WaitStillnessOrTurn(
                     "Board motion detected (diff=${meanDiff.toInt()}) — waiting offline for coins to settle (0 API)."
                 )
             }
         }
 
-        // 2. Detect bottom slider knob (present below the board when it's our turn in Carrom Pool / King)
+        // 2. Detect bottom slider knob (supports both vivid knobs and custom patterned skins via track-contrast)
         val sliderKnobPx = detectBottomSliderKnob(
             bitmap = screenshot,
             boardLeft = boardBmLeft,
@@ -91,7 +94,7 @@ object CarromVisionDetector {
             scaleY = scaleY
         )
 
-        // 3. Scan board region into clustered pieces
+        // 3. Scan board region into clustered pieces (subdividing touching break clusters)
         val rawPieces = detectBoardPieces(
             bitmap = screenshot,
             left = boardBmLeft,
@@ -112,7 +115,7 @@ object CarromVisionDetector {
         val coinRadius = boardWidthPx * 0.029f
         val strikerRadius = boardWidthPx * 0.036f
         val pocketRadius = boardWidthPx * 0.052f
-        val pocketInset = boardWidthPx * 0.072f
+        val pocketInset = boardWidthPx * 0.064f
 
         val pockets = listOf(
             Point2D(boardLeft + pocketInset, boardTop + pocketInset),
@@ -122,8 +125,35 @@ object CarromVisionDetector {
         )
         val defaultBaselineY = boardTop + boardHeightPx * 0.845f
 
+        // 4. Color-agnostic bottom baseline striker detection (matches ANY striker color/skin/halo)
+        val contrastStriker = if (rawPieces.none { it.color == CoinColor.STRIKER }) {
+            detectAnyStrikerOnBaseline(
+                bitmap = screenshot,
+                boardLeft = boardBmLeft,
+                boardTop = boardBmTop,
+                boardRight = boardBmRight,
+                boardBottom = boardBmBottom,
+                scaleX = scaleX,
+                scaleY = scaleY,
+                strikerRadiusPx = strikerRadius,
+                sliderKnobPx = sliderKnobPx
+            )
+        } else {
+            null
+        }
+
+        val prelimStriker = contrastStriker ?: rawPieces.firstOrNull { it.color == CoinColor.STRIKER }
+        val cleanedPieces = if (prelimStriker != null) {
+            val clearR = strikerRadius * 1.40f
+            rawPieces.filter { p ->
+                p === prelimStriker || (p.center - prelimStriker.center).length() > clearR
+            } + if (contrastStriker != null) listOf(contrastStriker) else emptyList()
+        } else {
+            rawPieces
+        }
+
         val promoted = promoteOrAnchorStriker(
-            pieces = rawPieces,
+            pieces = cleanedPieces,
             baselineY = defaultBaselineY,
             boardLeft = boardLeft,
             boardRight = boardRight,
@@ -134,7 +164,7 @@ object CarromVisionDetector {
 
         if (promoted.size < 2) {
             return CarromVisionOutcome.NeedsAiVision(
-                diagnostic = "Detected ${promoted.size} Carrom piece(s); delegating to AI Vision.",
+                diagnostic = "Detected ${promoted.size} Carrom piece(s) (slider=${sliderKnobPx != null}); delegating to AI Vision.",
                 boardPieces = promoted
             )
         }
@@ -144,12 +174,12 @@ object CarromVisionDetector {
             return if (consecutiveOfflineWaits < 1) {
                 // Wait at most 1 short cycle if baseline looks empty (opponent turn), then let AI inspect.
                 CarromVisionOutcome.WaitStillnessOrTurn(
-                    reason = "Striker not on baseline (likely opponent turn) — waiting offline (0 API).",
+                    reason = "Striker/slider not on bottom baseline (likely opponent turn) — waiting once offline (0 API).",
                     boardPieces = promoted
                 )
             } else {
                 CarromVisionOutcome.NeedsAiVision(
-                    diagnostic = "Striker not matched locally after wait; delegating to AI Vision.",
+                    diagnostic = "Striker not matched locally (${promoted.size} coins visible, no slider knob); delegating shot to AI Vision.",
                     boardPieces = promoted
                 )
             }
@@ -175,7 +205,7 @@ object CarromVisionDetector {
             screenWidth = screenWidth,
             screenHeight = screenHeight,
             existingStriker = strikerPiece,
-            canRepositionStriker = sliderKnobPx != null,
+            canRepositionStriker = allowStrikerRepositioning && (sliderKnobPx != null),
             shotMemory = shotMemory
         )
 
@@ -188,8 +218,9 @@ object CarromVisionDetector {
                 boardPieces = promoted
             )
         } else {
+            val myTargetsCount = promoted.count { it.color == myCoinColor || it.color == CoinColor.QUEEN }
             CarromVisionOutcome.NeedsAiVision(
-                diagnostic = "No high-confidence offline Carrom shot found; using AI Vision.",
+                diagnostic = "No offline shot (targets=$myTargetsCount, total=${promoted.size}, striker=${strikerPiece != null}); using AI Vision.",
                 boardPieces = promoted
             )
         }
@@ -247,11 +278,11 @@ object CarromVisionDetector {
         val boardW = (right - left).coerceAtLeast(40)
         val defaultTop = ((h - boardW) * 0.48f).toInt().coerceIn(0, h - 40)
 
-        // Refine top within +-8% of screen height only if there is clear inside-vs-outside border contrast
+        // Refine top within +-12% of screen height using symmetric top + bottom board border contrast
         val xStart = left + (boardW * 0.25f).toInt()
         val xEnd = right - (boardW * 0.25f).toInt()
-        val searchMinY = (defaultTop - (h * 0.08f).toInt()).coerceAtLeast(0)
-        val searchMaxY = (defaultTop + (h * 0.08f).toInt()).coerceAtMost(h - boardW - 1).coerceAtLeast(searchMinY)
+        val searchMinY = (defaultTop - (h * 0.12f).toInt()).coerceAtLeast(0)
+        val searchMaxY = (defaultTop + (h * 0.12f).toInt()).coerceAtMost(h - boardW - 1).coerceAtLeast(searchMinY)
 
         fun avgRowLuma(py: Int): Float {
             val clampedY = py.coerceIn(0, h - 1)
@@ -267,18 +298,13 @@ object CarromVisionDetector {
             return if (count > 0) rowLuma.toFloat() / count else 0f
         }
 
+        val edgePadIn = (boardW * 0.08f).toInt().coerceAtLeast(10)
+        val edgePadOut = (boardW * 0.045f).toInt().coerceAtLeast(10)
+
         fun scoreCandidate(candidateTop: Int): Float {
-            var insideSum = 0f
-            val probeRows = 6
-            for (r in 1..probeRows) {
-                val py = candidateTop + (boardW * r) / (probeRows + 1)
-                insideSum += avgRowLuma(py)
-            }
-            val insideAvg = insideSum / probeRows
-            val aboveY = (candidateTop - 16).coerceAtLeast(0)
-            val belowY = (candidateTop + boardW + 16).coerceAtMost(h - 1)
-            val outsideAvg = (avgRowLuma(aboveY) + avgRowLuma(belowY)) * 0.5f
-            return insideAvg - outsideAvg
+            val topContrast = avgRowLuma(candidateTop + edgePadIn) - avgRowLuma(candidateTop - edgePadOut)
+            val bottomContrast = avgRowLuma(candidateTop + boardW - edgePadIn) - avgRowLuma(candidateTop + boardW + edgePadOut)
+            return minOf(topContrast, bottomContrast) + (topContrast + bottomContrast) * 0.5f
         }
 
         val defaultScore = scoreCandidate(defaultTop)
@@ -294,7 +320,7 @@ object CarromVisionDetector {
             y += 6
         }
 
-        val finalTop = if (bestScore > defaultScore + 15f && bestScore > 25f) bestTop else defaultTop
+        val finalTop = if (bestScore > defaultScore + 8f && bestScore > 16f) bestTop else defaultTop
         val finalBottom = (finalTop + boardW).coerceAtMost(h - 1)
         return BoardBmBounds(left = left, top = finalTop, right = right, bottom = finalBottom)
     }
@@ -307,8 +333,8 @@ object CarromVisionDetector {
         scaleX: Float,
         scaleY: Float
     ): Point2D? {
-        val sliderTop = (boardBottom + (bitmap.height * 0.015f).toInt()).coerceIn(0, bitmap.height - 2)
-        val sliderBottom = (boardBottom + (bitmap.height * 0.165f).toInt()).coerceIn(sliderTop + 1, bitmap.height - 1)
+        val sliderTop = (boardBottom + (bitmap.height * 0.012f).toInt()).coerceIn(0, bitmap.height - 2)
+        val sliderBottom = (boardBottom + (bitmap.height * 0.21f).toInt()).coerceIn(sliderTop + 1, bitmap.height - 1)
         val bw = (boardRight - boardLeft).coerceAtLeast(1)
         val bh = (sliderBottom - sliderTop).coerceAtLeast(1)
         val cols = (bw / SAMPLE_STEP).coerceAtLeast(1)
@@ -325,10 +351,12 @@ object CarromVisionDetector {
                 val h = hsv[0]
                 val s = hsv[1]
                 val v = hsv[2]
-                // Slider knobs are vivid glowing discs (gold/orange/cyan/white) — exclude muted wood tones
-                active[r][c] = (s >= 0.65f && v >= 0.68f && h in 20f..65f) ||
-                    (s >= 0.48f && v >= 0.55f && h in 160f..225f) ||
-                    (s <= 0.18f && v >= 0.92f)
+                // Slider knobs are vivid/bright discs (gold/amber, cyan/blue, emerald, ruby, silver/white) — exclude muted tan wood
+                active[r][c] = (s >= 0.58f && v >= 0.65f && h in 20f..66f) ||
+                    (s >= 0.42f && v >= 0.50f && h in 158f..235f) ||
+                    (s >= 0.45f && v >= 0.48f && h in 88f..157f) ||
+                    (s >= 0.55f && v >= 0.55f && (h <= 18f || h >= 336f)) ||
+                    (s <= 0.24f && v >= 0.84f)
             }
         }
 
@@ -363,14 +391,95 @@ object CarromVisionDetector {
                     }
                 }
 
-                // Knob should be a compact disc (not a wide full-width bar)
-                if (count in 5..110 && count > bestCount) {
+                // Knob should be a compact disc (not a wide full-width track/bar)
+                if (count in 4..180 && count > bestCount) {
                     bestCount = count
                     bestCenter = Point2D(sumX / count, sumY / count)
                 }
             }
         }
-        return bestCenter
+        if (bestCenter != null) return bestCenter
+
+        // Fallback: row-wise track-contrast check catches patterned/brown/dark/custom striker skins inside the slider bar
+        val trackColStart = (cols * 0.18f).toInt().coerceIn(0, cols - 1)
+        val trackColEnd = (cols * 0.82f).toInt().coerceIn(trackColStart, cols - 1)
+        val contrastActive = Array(rows) { BooleanArray(cols) }
+        val rowR = IntArray(trackColEnd - trackColStart + 1)
+        val rowG = IntArray(trackColEnd - trackColStart + 1)
+        val rowB = IntArray(trackColEnd - trackColStart + 1)
+
+        for (r in 0 until rows) {
+            val py = (sliderTop + r * SAMPLE_STEP).coerceIn(0, bitmap.height - 1)
+            var idx = 0
+            for (c in trackColStart..trackColEnd) {
+                val px = (boardLeft + c * SAMPLE_STEP).coerceIn(0, bitmap.width - 1)
+                val p = bitmap.getPixel(px, py)
+                rowR[idx] = Color.red(p)
+                rowG[idx] = Color.green(p)
+                rowB[idx] = Color.blue(p)
+                idx++
+            }
+            val medR = medianOfCopy(rowR, idx)
+            val medG = medianOfCopy(rowG, idx)
+            val medB = medianOfCopy(rowB, idx)
+
+            for (c in trackColStart..trackColEnd) {
+                val px = (boardLeft + c * SAMPLE_STEP).coerceIn(0, bitmap.width - 1)
+                val p = bitmap.getPixel(px, py)
+                val diff = abs(Color.red(p) - medR) + abs(Color.green(p) - medG) + abs(Color.blue(p) - medB)
+                contrastActive[r][c] = diff >= 54
+            }
+        }
+
+        val cVisited = Array(rows) { BooleanArray(cols) }
+        var contrastBestCenter: Point2D? = null
+        var contrastBestCount = 0
+        for (r in 0 until rows) {
+            for (c in trackColStart..trackColEnd) {
+                if (!contrastActive[r][c] || cVisited[r][c]) continue
+                var sumX = 0f
+                var sumY = 0f
+                var count = 0
+                var minR = r
+                var maxR = r
+                var minC = c
+                var maxC = c
+                queue.add(r to c)
+                cVisited[r][c] = true
+
+                while (queue.isNotEmpty()) {
+                    val (cr, cc) = queue.removeFirst()
+                    sumX += (boardLeft + cc * SAMPLE_STEP) * scaleX
+                    sumY += (sliderTop + cr * SAMPLE_STEP) * scaleY
+                    count++
+                    if (cr < minR) minR = cr
+                    if (cr > maxR) maxR = cr
+                    if (cc < minC) minC = cc
+                    if (cc > maxC) maxC = cc
+                    for (dr in -1..1) {
+                        for (dc in -1..1) {
+                            val nr = cr + dr
+                            val nc = cc + dc
+                            if (nr in 0 until rows && nc in trackColStart..trackColEnd &&
+                                !cVisited[nr][nc] && contrastActive[nr][nc]
+                            ) {
+                                cVisited[nr][nc] = true
+                                queue.add(nr to nc)
+                            }
+                        }
+                    }
+                }
+
+                val spanR = (maxR - minR + 1).coerceAtLeast(1)
+                val spanC = (maxC - minC + 1).coerceAtLeast(1)
+                val aspect = maxOf(spanR, spanC).toFloat() / minOf(spanR, spanC).toFloat()
+                if (count in 5..180 && spanR >= 2 && spanC <= (cols * 0.16f).toInt().coerceAtLeast(8) && aspect <= 2.4f && count > contrastBestCount) {
+                    contrastBestCount = count
+                    contrastBestCenter = Point2D(sumX / count, sumY / count)
+                }
+            }
+        }
+        return contrastBestCenter
     }
 
     private fun promoteOrAnchorStriker(
@@ -384,7 +493,7 @@ object CarromVisionDetector {
     ): List<CarromPiece> {
         if (pieces.any { it.color == CoinColor.STRIKER }) return pieces
 
-        val baselineTolerance = boardHeightPx * 0.08f
+        val baselineTolerance = boardHeightPx * 0.085f
         val baselineCandidates = pieces.filter { abs(it.center.y - baselineY) <= baselineTolerance }
 
         // 1. If bottom slider knob is detected, match the piece on the baseline closest to slider X
@@ -408,13 +517,18 @@ object CarromVisionDetector {
             )
         }
 
-        // 2. Fallback without slider: promote a larger white/distinct disc sitting squarely on the baseline
+        // 2. Fallback without slider: promote only a genuine striker-sized disc inside the playable middle baseline
         val avgRadius = pieces.map { it.radiusPx }.average().toFloat().coerceAtLeast(14f)
+        val midLeft = boardLeft + (boardRight - boardLeft) * 0.21f
+        val midRight = boardLeft + (boardRight - boardLeft) * 0.79f
         val tightBaselineCandidate = baselineCandidates
-            .filter { abs(it.center.y - baselineY) <= boardHeightPx * 0.048f }
+            .filter {
+                abs(it.center.y - baselineY) <= boardHeightPx * 0.055f &&
+                    it.center.x in midLeft..midRight
+            }
             .maxByOrNull { it.radiusPx }
         if (tightBaselineCandidate != null &&
-            (tightBaselineCandidate.radiusPx >= avgRadius * 1.06f || baselineCandidates.size == 1)
+            tightBaselineCandidate.radiusPx >= maxOf(avgRadius * 1.10f, strikerRadiusPx * 0.90f)
         ) {
             return pieces.map { piece ->
                 if (piece === tightBaselineCandidate) piece.copy(color = CoinColor.STRIKER) else piece
@@ -460,22 +574,22 @@ object CarromVisionDetector {
                 val s = hsv[1]
                 val v = hsv[2]
 
-                val isBaselineBand = abs(dy - bh * 0.845f) < bh * 0.085f
+                val isBaselineBand = abs(dy - bh * 0.845f) < bh * 0.105f
 
                 labels[r][c] = when {
                     // Striker: distinct colored disc/ring on baseline (cyan/blue, vivid gold, purple, green)
                     isBaselineBand && (
-                        (h in 165f..245f && s >= 0.36f && v >= 0.42f) ||
-                            (h in 36f..60f && s >= 0.58f && v >= 0.72f) ||
-                            (h in 260f..325f && s >= 0.42f && v >= 0.42f) ||
-                            (h in 85f..155f && s >= 0.45f && v >= 0.45f)
+                        (h in 162f..245f && s >= 0.34f && v >= 0.40f) ||
+                            (h in 36f..62f && s >= 0.56f && v >= 0.70f) ||
+                            (h in 260f..325f && s >= 0.40f && v >= 0.40f) ||
+                            (h in 85f..155f && s >= 0.42f && v >= 0.42f)
                         ) -> CoinColor.STRIKER
                     // Queen: saturated red/crimson
                     (h >= 338f || h <= 16f) && s >= 0.48f && v >= 0.35f -> CoinColor.QUEEN
-                    // White coin: bright ivory/white with low saturation
-                    s <= 0.25f && v >= 0.74f -> CoinColor.WHITE
+                    // White coin: bright ivory/white with low saturation (safely excludes tan wood s>=0.35)
+                    s <= 0.28f && v >= 0.69f -> CoinColor.WHITE
                     // Black coin: dark grey/charcoal disc inside wooden board
-                    v in 0.06f..0.29f && s <= 0.42f -> CoinColor.BLACK
+                    v in 0.06f..0.30f && s <= 0.42f -> CoinColor.BLACK
                     else -> null
                 }
             }
@@ -484,6 +598,7 @@ object CarromVisionDetector {
         val visited = Array(rows) { BooleanArray(cols) }
         val detected = mutableListOf<CarromPiece>()
         val queue = ArrayDeque<Pair<Int, Int>>()
+        val bucketCellPx = (bw * scaleX * 0.056f).coerceAtLeast(24f)
 
         for (r in 0 until rows) {
             for (c in 0 until cols) {
@@ -493,14 +608,20 @@ object CarromVisionDetector {
                 var sumX = 0f
                 var sumY = 0f
                 var count = 0
+                val clusterPoints = ArrayList<Point2D>(64)
                 queue.add(r to c)
                 visited[r][c] = true
 
                 while (queue.isNotEmpty()) {
                     val (cr, cc) = queue.removeFirst()
-                    sumX += (left + cc * SAMPLE_STEP) * scaleX
-                    sumY += (top + cr * SAMPLE_STEP) * scaleY
+                    val sx = (left + cc * SAMPLE_STEP) * scaleX
+                    val sy = (top + cr * SAMPLE_STEP) * scaleY
+                    sumX += sx
+                    sumY += sy
                     count++
+                    if (clusterPoints.size < 900) {
+                        clusterPoints.add(Point2D(sx, sy))
+                    }
 
                     for (dr in -1..1) {
                         for (dc in -1..1) {
@@ -517,18 +638,187 @@ object CarromVisionDetector {
                     }
                 }
 
-                val maxCluster = if (color == CoinColor.STRIKER) 170 else 110
-                if (count in 4..maxCluster) {
+                if (color == CoinColor.STRIKER) {
+                    if (count in 4..260) {
+                        val cx = sumX / count
+                        val cy = sumY / count
+                        val radiusApprox = (kotlin.math.sqrt(count.toFloat() / 3.14f) * SAMPLE_STEP * scaleX)
+                            .coerceIn(14f, 68f)
+                        detected.add(CarromPiece(color, Point2D(cx, cy), radiusApprox))
+                    }
+                } else if (count in 4..75) {
                     val cx = sumX / count
                     val cy = sumY / count
                     val radiusApprox = (kotlin.math.sqrt(count.toFloat() / 3.14f) * SAMPLE_STEP * scaleX)
                         .coerceIn(14f, 68f)
                     detected.add(CarromPiece(color, Point2D(cx, cy), radiusApprox))
+                } else if (count in 76..900) {
+                    // Subdivide touching multi-coin clusters (e.g. opening break ring) instead of dropping them!
+                    val buckets = LinkedHashMap<Pair<Int, Int>, MutableList<Point2D>>()
+                    for (pt in clusterPoints) {
+                        val bx = (pt.x / bucketCellPx).toInt()
+                        val by = (pt.y / bucketCellPx).toInt()
+                        buckets.getOrPut(bx to by) { mutableListOf() }.add(pt)
+                    }
+                    for ((_, pts) in buckets) {
+                        if (pts.size >= 3) {
+                            val avgX = pts.sumOf { it.x.toDouble() }.toFloat() / pts.size
+                            val avgY = pts.sumOf { it.y.toDouble() }.toFloat() / pts.size
+                            detected.add(CarromPiece(color, Point2D(avgX, avgY), (bucketCellPx * 0.48f).coerceIn(16f, 44f)))
+                        }
+                    }
                 }
             }
         }
 
         return detected
+    }
+
+    private fun detectAnyStrikerOnBaseline(
+        bitmap: Bitmap,
+        boardLeft: Int,
+        boardTop: Int,
+        boardRight: Int,
+        boardBottom: Int,
+        scaleX: Float,
+        scaleY: Float,
+        strikerRadiusPx: Float,
+        sliderKnobPx: Point2D?
+    ): CarromPiece? {
+        val bw = (boardRight - boardLeft).coerceAtLeast(40)
+        val bh = (boardBottom - boardTop).coerceAtLeast(40)
+        val (woodR, woodG, woodB) = estimateBoardWoodRgb(bitmap, boardLeft, boardTop, boardRight, boardBottom)
+
+        val scanLeft = (boardLeft + (bw * 0.14f).toInt()).coerceIn(0, bitmap.width - 2)
+        val scanRight = (boardLeft + (bw * 0.86f).toInt()).coerceIn(scanLeft + 2, bitmap.width - 1)
+        val scanTop = (boardTop + (bh * 0.76f).toInt()).coerceIn(0, bitmap.height - 2)
+        val scanBottom = (boardTop + (bh * 0.93f).toInt()).coerceIn(scanTop + 2, bitmap.height - 1)
+
+        val cols = ((scanRight - scanLeft) / SAMPLE_STEP).coerceAtLeast(1)
+        val rows = ((scanBottom - scanTop) / SAMPLE_STEP).coerceAtLeast(1)
+        if (cols < 4 || rows < 3) return null
+
+        val nonWood = Array(rows) { BooleanArray(cols) }
+        for (r in 0 until rows) {
+            val py = (scanTop + r * SAMPLE_STEP).coerceIn(0, bitmap.height - 1)
+            for (c in 0 until cols) {
+                val px = (scanLeft + c * SAMPLE_STEP).coerceIn(0, bitmap.width - 1)
+                val p = bitmap.getPixel(px, py)
+                val diff = abs(Color.red(p) - woodR) + abs(Color.green(p) - woodG) + abs(Color.blue(p) - woodB)
+                nonWood[r][c] = diff >= 56
+            }
+        }
+
+        val visited = Array(rows) { BooleanArray(cols) }
+        val queue = ArrayDeque<Pair<Int, Int>>()
+        val innerSafeLeftPx = (boardLeft + bw * 0.21f) * scaleX
+        val innerSafeRightPx = (boardLeft + bw * 0.79f) * scaleX
+        val boardWidthPx = bw * scaleX
+
+        var bestPiece: CarromPiece? = null
+        var bestScore = 0f
+
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                if (!nonWood[r][c] || visited[r][c]) continue
+                var sumX = 0f
+                var sumY = 0f
+                var count = 0
+                var minR = r
+                var maxR = r
+                var minC = c
+                var maxC = c
+                queue.add(r to c)
+                visited[r][c] = true
+
+                while (queue.isNotEmpty()) {
+                    val (cr, cc) = queue.removeFirst()
+                    sumX += (scanLeft + cc * SAMPLE_STEP) * scaleX
+                    sumY += (scanTop + cr * SAMPLE_STEP) * scaleY
+                    count++
+                    if (cr < minR) minR = cr
+                    if (cr > maxR) maxR = cr
+                    if (cc < minC) minC = cc
+                    if (cc > maxC) maxC = cc
+                    for (dr in -1..1) {
+                        for (dc in -1..1) {
+                            val nr = cr + dr
+                            val nc = cc + dc
+                            if (nr in 0 until rows && nc in 0 until cols && !visited[nr][nc] && nonWood[nr][nc]) {
+                                visited[nr][nc] = true
+                                queue.add(nr to nc)
+                            }
+                        }
+                    }
+                }
+
+                val spanR = (maxR - minR + 1).coerceAtLeast(1)
+                val spanC = (maxC - minC + 1).coerceAtLeast(1)
+                val aspect = maxOf(spanR, spanC).toFloat() / minOf(spanR, spanC).toFloat()
+                if (count !in 8..280 || spanR < 3 || spanC < 3 || aspect > 2.2f) continue
+
+                val cx = sumX / count
+                val cy = sumY / count
+                val inSafeMidZone = cx in innerSafeLeftPx..innerSafeRightPx
+                val nearSlider = sliderKnobPx != null && abs(cx - sliderKnobPx.x) <= boardWidthPx * 0.14f
+                val approxUnclampedR = kotlin.math.sqrt(count.toFloat() / 3.14f) * SAMPLE_STEP * scaleX
+                if (!inSafeMidZone && !nearSlider && approxUnclampedR < strikerRadiusPx * 0.92f) {
+                    // Ignore small stationary orange baseline end-circles at any screen DPI when no slider knob is near
+                    continue
+                }
+
+                val score = count.toFloat() + (if (nearSlider) 120f else 0f) + (if (inSafeMidZone) 40f else 0f)
+                if (score > bestScore) {
+                    bestScore = score
+                    val approxR = approxUnclampedR.coerceIn(strikerRadiusPx * 0.8f, strikerRadiusPx * 1.45f)
+                    bestPiece = CarromPiece(CoinColor.STRIKER, Point2D(cx, cy), approxR)
+                }
+            }
+        }
+        return bestPiece
+    }
+
+    private fun estimateBoardWoodRgb(
+        bitmap: Bitmap,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int
+    ): Triple<Int, Int, Int> {
+        val bw = (right - left).coerceAtLeast(1)
+        val bh = (bottom - top).coerceAtLeast(1)
+        val maxSamples = 144
+        val rs = IntArray(maxSamples)
+        val gs = IntArray(maxSamples)
+        val bs = IntArray(maxSamples)
+        var count = 0
+
+        for (gy in 0 until 12) {
+            val fy = 0.18f + gy * (0.64f / 11f)
+            val py = (top + bh * fy).toInt().coerceIn(0, bitmap.height - 1)
+            for (gx in 0 until 12) {
+                val fx = 0.18f + gx * (0.64f / 11f)
+                // Skip center break-rack region so clustered coins don't skew median wood color
+                if (fx in 0.34f..0.66f && fy in 0.34f..0.66f) continue
+                val px = (left + bw * fx).toInt().coerceIn(0, bitmap.width - 1)
+                val p = bitmap.getPixel(px, py)
+                if (count < maxSamples) {
+                    rs[count] = Color.red(p)
+                    gs[count] = Color.green(p)
+                    bs[count] = Color.blue(p)
+                    count++
+                }
+            }
+        }
+        if (count == 0) return Triple(205, 165, 110)
+        return Triple(medianOfCopy(rs, count), medianOfCopy(gs, count), medianOfCopy(bs, count))
+    }
+
+    private fun medianOfCopy(values: IntArray, length: Int): Int {
+        if (length <= 0) return 0
+        val copy = values.copyOf(length)
+        copy.sort()
+        return copy[length / 2]
     }
 
     private fun sampleBoardLumaGrid(

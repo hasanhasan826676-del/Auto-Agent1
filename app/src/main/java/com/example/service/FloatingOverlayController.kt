@@ -117,6 +117,28 @@ class FloatingOverlayController(private val context: Context) {
         }
     }
 
+    fun setTouchPassthrough(passthrough: Boolean) {
+        val view = rootView ?: return
+        val params = layoutParams ?: return
+        val runnable = Runnable {
+            val baseFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            val desiredFlags = if (passthrough) {
+                baseFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            } else {
+                baseFlags
+            }
+            if (params.flags != desiredFlags) {
+                params.flags = desiredFlags
+                runCatching { windowManager.updateViewLayout(view, params) }
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            runnable.run()
+        } else {
+            mainHandler.post(runnable)
+        }
+    }
+
     fun destroy() {
         mainHandler.post { hideInternal() }
     }

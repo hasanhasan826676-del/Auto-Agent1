@@ -1096,4 +1096,139 @@ class AgentLogicUnitTest {
         org.junit.Assert.assertNotNull(guidedSolution)
         assertEquals(0, guidedSolution!!.pocketIndex)
     }
+
+    @Test
+    fun `forceVision keeps screenshot and high accuracy for carrom even with 8 HUD buttons`() {
+        val settings = AgentSettings(smartTextFastPath = true)
+
+        // Normal UI screen on step 3 with 8 buttons uses FAST_UI without screenshot
+        val (uiProfile, uiAttach) = com.example.ai.GeminiAiPlanner.resolveVisionStrategy(
+            settings = settings,
+            interactiveNodes = 8,
+            lastOutcomeHint = "",
+            stepNumber = 3,
+            forceVision = false
+        )
+        assertEquals(com.example.ai.AiTaskProfile.FAST_UI, uiProfile)
+        assertFalse(uiAttach)
+
+        // Carrom match screen with 8 HUD buttons (chat, emoji, mic, avatar, gift, settings) keeps HIGH_ACCURACY + screenshot
+        val (carromProfile, carromAttach) = com.example.ai.GeminiAiPlanner.resolveVisionStrategy(
+            settings = settings,
+            interactiveNodes = 8,
+            lastOutcomeHint = "",
+            stepNumber = 3,
+            forceVision = true
+        )
+        assertEquals(com.example.ai.AiTaskProfile.HIGH_ACCURACY, carromProfile)
+        assertTrue(carromAttach)
+    }
+
+    @Test
+    fun `carrom context matches bengali spellings and distinguishes match HUD from lobby menu`() {
+        assertTrue(
+            com.example.agent.CarromContextHelper.isCarromGoalOrApp(
+                goal = "ক্যারম খেলো",
+                packageName = "com.unknown.game",
+                playbookTopicKey = null
+            )
+        )
+        assertTrue(
+            com.example.agent.CarromContextHelper.isCarromGoalOrApp(
+                goal = "কেরাম বোর্ড",
+                packageName = "com.example",
+                playbookTopicKey = null
+            )
+        )
+
+        fun hudNode(id: Int, label: String) = ScreenNode(
+            id = id,
+            className = "android.widget.ImageButton",
+            text = label,
+            contentDesc = label,
+            viewId = "hud_$id",
+            bounds = ScreenBounds(10, 10, 90, 90),
+            isClickable = true,
+            isEditable = false,
+            isScrollable = false,
+            isChecked = false,
+            isFocused = false
+        )
+
+        val matchHudNodes = listOf(
+            hudNode(1, "Chat"),
+            hudNode(2, "Emoji"),
+            hudNode(3, "Mic"),
+            hudNode(4, "Gift"),
+            hudNode(5, "Settings"),
+            hudNode(6, "Pause")
+        )
+        assertFalse(com.example.agent.CarromContextHelper.isLikelyGameLobbyMenu(matchHudNodes))
+
+        val lobbyNodes = matchHudNodes + hudNode(7, "Play Classic")
+        assertTrue(com.example.agent.CarromContextHelper.isLikelyGameLobbyMenu(lobbyNodes))
+    }
+
+    @Test
+    fun `carrom geometry solver falls back to available coins in freestyle and guarantees break shot`() {
+        val board = com.example.game.CarromBoardLayout(
+            left = 60f,
+            top = 500f,
+            right = 1020f,
+            bottom = 1460f,
+            pockets = listOf(
+                com.example.game.Point2D(120f, 560f),
+                com.example.game.Point2D(960f, 560f),
+                com.example.game.Point2D(120f, 1400f),
+                com.example.game.Point2D(960f, 1400f)
+            ),
+            baselineY = 1312f,
+            coinRadiusPx = 28f,
+            strikerRadiusPx = 35f,
+            pocketRadiusPx = 50f
+        )
+        val striker = com.example.game.CarromPiece(
+            color = com.example.game.CoinColor.STRIKER,
+            center = com.example.game.Point2D(540f, 1312f),
+            radiusPx = 35f
+        )
+
+        // 1. Freestyle/late-game: no WHITE or QUEEN coins remain, only BLACK coins
+        val onlyBlack = listOf(
+            com.example.game.CarromPiece(com.example.game.CoinColor.BLACK, com.example.game.Point2D(520f, 960f), 28f),
+            com.example.game.CarromPiece(com.example.game.CoinColor.BLACK, com.example.game.Point2D(580f, 980f), 28f),
+            striker
+        )
+        val freestyleShot = com.example.game.CarromGeometrySolver.solveBestShot(
+            board = board,
+            pieces = onlyBlack,
+            myCoinColor = com.example.game.CoinColor.WHITE,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            existingStriker = striker,
+            canRepositionStriker = false
+        )
+        org.junit.Assert.assertNotNull(freestyleShot)
+
+        // 2. Tight center break rack with fixed center striker must still guarantee a break shot
+        val breakRack = listOf(
+            com.example.game.CarromPiece(com.example.game.CoinColor.QUEEN, com.example.game.Point2D(540f, 980f), 28f),
+            com.example.game.CarromPiece(com.example.game.CoinColor.WHITE, com.example.game.Point2D(540f, 930f), 28f),
+            com.example.game.CarromPiece(com.example.game.CoinColor.WHITE, com.example.game.Point2D(584f, 955f), 28f),
+            com.example.game.CarromPiece(com.example.game.CoinColor.WHITE, com.example.game.Point2D(496f, 955f), 28f),
+            com.example.game.CarromPiece(com.example.game.CoinColor.BLACK, com.example.game.Point2D(540f, 1030f), 28f),
+            striker
+        )
+        val breakShot = com.example.game.CarromGeometrySolver.solveBestShot(
+            board = board,
+            pieces = breakRack,
+            myCoinColor = com.example.game.CoinColor.WHITE,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            existingStriker = striker,
+            canRepositionStriker = false
+        )
+        org.junit.Assert.assertNotNull(breakShot)
+        assertTrue(breakShot!!.confidenceScore >= 0.50f)
+    }
 }

@@ -437,3 +437,41 @@ data class AgentSettings(
         }
     }
 }
+
+object CarromContextHelper {
+    fun isCarromGoalOrApp(
+        goal: String,
+        packageName: String,
+        playbookTopicKey: String?
+    ): Boolean {
+        return goal.contains("carrom", ignoreCase = true) ||
+            goal.contains("ক্যারাম", ignoreCase = true) ||
+            goal.contains("ক্যারম", ignoreCase = true) ||
+            goal.contains("কেরাম", ignoreCase = true) ||
+            goal.contains("কারাম", ignoreCase = true) ||
+            goal.contains("caram", ignoreCase = true) ||
+            goal.contains("disc pool", ignoreCase = true) ||
+            packageName.contains("carrom", ignoreCase = true) ||
+            packageName.contains("caram", ignoreCase = true) ||
+            (playbookTopicKey?.contains("carrom", ignoreCase = true) == true)
+    }
+
+    fun isLikelyGameLobbyMenu(nodes: List<ScreenNode>): Boolean {
+        val lobbyLabels = setOf(
+            "play", "play classic", "disc pool", "freestyle", "carrom",
+            "shop", "store", "tournament", "matchmaking", "find match",
+            "claim", "collect", "login", "sign in", "continue", "খেলুন", "খেলা শুরু"
+        )
+        return nodes.any { node ->
+            if (!node.isClickable) return@any false
+            val label = node.displayLabel().trim().lowercase()
+            label.isNotBlank() && (
+                label in lobbyLabels ||
+                    label.startsWith("play ") ||
+                    label.contains("classic") ||
+                    label.contains("disc pool") ||
+                    label.contains("freestyle")
+                )
+        }
+    }
+}

@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Path
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.accessibility.AccessibilityNodeInfo
@@ -216,6 +217,24 @@ object GestureExecutor {
         endY: Float,
         durationMs: Long = 380L
     ): Boolean {
+        if (durationMs >= 480L && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Brief 75ms touch-down hold lets game engines (Unity/Cocos2d-x) lock onto the striker before pulling back
+            val holdPath = Path().apply { moveTo(startX, startY) }
+            val holdStroke = GestureDescription.StrokeDescription(holdPath, 0L, 75L, true)
+            val holdGesture = GestureDescription.Builder().addStroke(holdStroke).build()
+            if (!dispatchAndAwait(service, holdGesture)) {
+                return false
+            }
+
+            val pullPath = Path().apply {
+                moveTo(startX, startY)
+                lineTo(endX, endY)
+            }
+            val pullStroke = holdStroke.continueStroke(pullPath, 0L, durationMs, false)
+            val pullGesture = GestureDescription.Builder().addStroke(pullStroke).build()
+            return dispatchAndAwait(service, pullGesture)
+        }
+
         val path = Path().apply {
             moveTo(startX, startY)
             lineTo(endX, endY)
